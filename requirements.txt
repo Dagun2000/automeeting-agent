@@ -1,0 +1,15 @@
+# Python 3.14 (버전 고정 — .python-version, pyproject.toml 참고)
+
+# --- Phase 1 (현재 구현 범위: 디버그 텍스트 입력 -> Minutes Generator -> Gate 0) ---
+langgraph>=0.2.60
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+streamlit>=1.38.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+requests>=2.32.0
+
+# --- 이후 Phase에서 필요 (아직 미사용, 참고용으로만 명시) ---
+# Phase 1(오디오 경로): openai-whisper 또는 faster-whisper, pyannote-audio 또는 whisperx
+# Phase 3: chromadb 또는 faiss-cpu (RAG), openai (DALL-E 3)
