@@ -10,6 +10,7 @@
 
 모델 티어: 스펙 5.1 - GPT-5.6 Luna.
 """
+import logging
 import os
 
 from langchain_core.output_parsers import StrOutputParser
@@ -17,6 +18,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from src.llm import build_chat_model
+from src.rag import format_rag_context
 from src.retry import next_feedback
 from src.state import AgentMeetingState, TaskFeedback
 from src.tagging import extract_tagged_content
@@ -36,6 +38,8 @@ REQUIRED_SPEC_FIELDS = [
 
 _FIELD_LIST_TEXT = "\n".join(f"{i + 1}. {field}" for i, field in enumerate(REQUIRED_SPEC_FIELDS))
 
+logger = logging.getLogger(__name__)
+
 WORKER_SYSTEM_PROMPT = f"""당신은 게임 기획서 작성 담당자(Spec Worker)입니다. 아래에
 주어지는, 회의록에서 선정된 하나의 아이디어에 관한 내용만을 근거로 기획서를
 작성하세요.
@@ -52,8 +56,16 @@ WORKER_SYSTEM_PROMPT = f"""당신은 게임 기획서 작성 담당자(Spec Work
 - "핵심 게임플레이 루프" 섹션 아래에는 그 루프를 나타내는 Mermaid 순서도를 반드시
   포함하세요(```mermaid 코드 블록, `flowchart TD` 형식). 회의 내용에서 루프를
   유추할 최소한의 근거조차 없다면 Mermaid 블록 없이 "TBD"라고만 적으세요.
-- 이전 시도에 대한 검증 피드백(critique)이 주어지면 반드시 그 지적사항을 반영해
-  다시 작성하세요.
+- 이전 시도에 대한 검증 피드백(critique)이 주어지면, **critique가 지적한 필드만
+  정확히 고치세요 - 전체를 다시 쓰는 게 아닙니다.** critique에 언급되지 않은
+  필드는 이전 기획서 그대로 유지하세요. 문제 없다고 이미 확인된 필드까지 다시
+  쓰면 거기서 새 오류가 생길 수 있습니다.
+
+## 참고 자료 활용
+사내 용어집/기존 게임 프로필이 "참고 자료"로 주어질 수 있습니다. 이건 용어
+표기를 맞추거나 맥락을 이해하는 데만 쓰고, 회의에서 언급되지 않은 내용을
+참고 자료에서 가져와 기획서 필드를 채우지 마세요 - 여전히 "회의에서
+명시적으로 언급됐는가"만이 근거입니다.
 """
 
 _worker_prompt = ChatPromptTemplate.from_messages(
@@ -62,6 +74,7 @@ _worker_prompt = ChatPromptTemplate.from_messages(
         (
             "human",
             "## 선정된 아이디어 관련 회의 내용\n{idea_content}\n\n"
+            "## 참고 자료 (사내 용어집/게임 프로필 - RAG 검색 결과)\n{rag_context}\n\n"
             "## 이전 시도 / 검증 피드백\n{feedback_block}\n\n"
             "위 내용을 반영해 기획서를 작성하세요.",
         ),
@@ -85,14 +98,19 @@ def spec_worker(state: AgentMeetingState) -> dict:
         feedback_block = (
             f"이전 기획서:\n{state.get('spec_document') or '(없음)'}\n\n"
             f"검증 피드백(critique):\n{prev_feedback['critique']}\n\n"
-            "위 피드백을 반드시 반영해 수정하세요."
+            "critique가 지적한 필드만 고치세요 - 지적되지 않은 필드는 이전"
+            " 기획서 그대로 유지하고 다시 쓰지 마세요."
         )
     else:
         feedback_block = "(초기 생성 - 이전 시도 없음)"
 
     chain = _build_worker_chain()
     spec_document = chain.invoke(
-        {"idea_content": idea_content, "feedback_block": feedback_block}
+        {
+            "idea_content": idea_content,
+            "rag_context": format_rag_context(state.get("rag_references") or []),
+            "feedback_block": feedback_block,
+        }
     )
     return {"spec_document": spec_document}
 
@@ -151,4 +169,16 @@ def spec_validator(state: AgentMeetingState) -> dict:
 
     prev_feedback = state.get("validation_status", {}).get("spec")
     feedback: TaskFeedback = next_feedback(prev_feedback, result.is_valid, result.critique)
+
+    if not result.is_valid:
+        logger.warning(
+            "spec_validator FAILED (retry_count=%d) - critique: %s\n"
+            "--- 검증 대상 기획서 ---\n%s",
+            feedback["retry_count"],
+            result.critique,
+            state["spec_document"],
+        )
+    else:
+        logger.info("spec_validator passed (retry_count=%d)", feedback["retry_count"])
+
     return {"validation_status": {"spec": feedback}}

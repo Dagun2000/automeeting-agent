@@ -19,9 +19,16 @@ def next_feedback(prev: Optional[TaskFeedback], is_valid: bool, critique: str) -
 
 
 def route_decision(feedback: TaskFeedback, max_retries: int) -> str:
-    """"done" / "retry" / "escalate" 중 하나를 반환."""
+    """"done" / "retry" / "escalate" 중 하나를 반환.
+
+    retry_count는 "지금까지 실패한 시도 횟수"이므로, 1차 시도가 실패한
+    시점에 이미 1이 된다. 그래서 `retry_count >= max_retries`로 비교하면
+    max_retries=2일 때 재시도가 실제로는 1번만 일어나고 에스컬레이션되는
+    오프바이원 버그가 있었다(실측 확인). "MAX_RETRIES번까지 재시도"라는
+    이름 그대로(총 MAX_RETRIES+1번 시도) 동작하도록 `>`로 비교한다.
+    """
     if feedback["is_valid"]:
         return "done"
-    if feedback["retry_count"] >= max_retries:
+    if feedback["retry_count"] > max_retries:
         return "escalate"
     return "retry"

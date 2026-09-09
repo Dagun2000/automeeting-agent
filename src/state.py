@@ -5,6 +5,9 @@
 from typing import Annotated, Dict, List, Optional, TypedDict
 import operator
 
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
 
 class TaskFeedback(TypedDict):
     is_valid: bool
@@ -63,6 +66,13 @@ class AgentMeetingState(TypedDict):
     # 6. 하위 산출물 결과
     setting_doc: Optional[str]
     reference_report: Optional[str]
+    # 스펙 5.4 원안에는 없는 필드 - reference_report Worker/Validator를 그래프
+    # 레벨 노드로 분리하면서 추가함(그전엔 한 노드 안의 지역 변수였음). 재시도
+    # 때 검색 대화를 이어가려면(웹 검색을 매번 처음부터 다시 하지 않으려면)
+    # 이 대화 기록이 노드 호출 사이에도 살아있어야 하는데, 별도 그래프 노드는
+    # 매번 새 함수 호출이라 지역 변수로는 안 되고 state에 있어야 한다.
+    # [src/nodes/reference_report.py](nodes/reference_report.py) 참고.
+    reference_report_messages: Annotated[List[AnyMessage], add_messages]
 
     # 7. 검증/에스컬레이션/기술적 실패
     validation_status: Annotated[Dict[str, TaskFeedback], operator.or_]

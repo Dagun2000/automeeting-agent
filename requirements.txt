@@ -5,11 +5,24 @@ langgraph>=0.2.60
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-openai>=0.2.0
+openai>=1.40.0
 streamlit>=1.38.0
 python-dotenv>=1.0.0
 pydantic>=2.7.0
-requests>=2.32.0
 
-# --- 이후 Phase에서 필요 (아직 미사용, 참고용으로만 명시) ---
-# Phase 1(오디오 경로): openai-whisper 또는 faster-whisper, pyannote-audio 또는 whisperx
-# Phase 3: chromadb 또는 faiss-cpu (RAG), openai (DALL-E 3)
+# --- Phase 4 (RAG: 사내 코퍼스 인덱싱/검색, src/rag.py) ---
+chromadb>=0.5.0
+langchain-chroma>=0.1.4
+
+# --- Phase 4 (STT: 브라우저 녹음 -> Whisper API, src/stt.py) ---
+# Diarization(화자 분리)은 구현하지 않음 - src/stt.py 모듈 docstring 참고.
+# st.audio_input()이 브라우저 녹음을 담당하므로(streamlit>=1.38.0) 별도
+# 오디오 캡처 라이브러리는 필요 없다.
+
+# --- 웹 검색 (ddgs 패키지, 다중 엔진 폴백 — src/tools.py) ---
+# 원래 Tavily(REST API + requests)를 썼으나 무료 티어 rate limit에 자주
+# 걸려 API 키가 필요 없는 ddgs로 교체함. ddgs 기본값("auto")은 느리고,
+# 단일 백엔드는 폴백이 없어 실측 결과 연속 검색 몇 번만에 막혀서
+# backend="duckduckgo,brave,google,startpage"로 고정함(src/tools.py
+# 모듈 docstring 참고).
+ddgs>=9.16.0
