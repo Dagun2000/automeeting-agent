@@ -27,9 +27,18 @@ docstring 참고). 이미지도 한때는 evidence 전달 문제로 한때 한 �
 docstring 참고.
 
 기획서 트랙이 재시도 한도를 초과해도(escalate) 이후 파이프라인은 계속
-진행한다 - Gate 2(에스컬레이션 확인)는 Fan-out 이후 한 번에 모아 보여주는
-단계이므로(2번 섹션 10단계), 한 트랙의 품질 실패가 다른 트랙 진행을 막지
-않는다(4.8, "나머지는 계속 진행"과 동일한 원칙을 품질 실패에도 적용).
+진행한다 - 완료 화면이 escalated_tasks/technical_failures를 한 번에 모아
+보여주므로, 한 트랙의 품질 실패가 다른 트랙 진행을 막지 않는다(4.8,
+"나머지는 계속 진행"과 동일한 원칙을 품질 실패에도 적용).
+
+기술적 실패(4.8 - API 에러/타임아웃/렌더링 실패 등)는 각 Worker/Validator
+노드 함수 안의 try/except가 잡아서 `technical_failures`에 기록한다(내용
+품질 실패인 `escalated_tasks`와는 별개 - [src/retry.py](retry.py) 모듈
+docstring, [src/nodes/image.py](nodes/image.py) 등 각 노드 참고). 그래프
+레벨에서는 `_make_validation_router`가 `has_technical_failure`부터 확인해서
+있으면 재시도 없이 바로 "done"으로 보낸다 - 기술적 실패는 API 재시도로
+바로 해결될 보장이 없어서(4.8도 자동 재시도를 요구하지 않음) 그 자리에서
+멈추고, 나머지 트랙은 그대로 진행된다.
 
 RAG Retrieval(5.2, 5.4): 트랜스크립트 확보 직후 사내 코퍼스(용어집/게임
 프로필)를 검색해 rag_references를 채운다([src/nodes/rag_retrieval.py](nodes/rag_retrieval.py)).
@@ -38,7 +47,19 @@ Minutes Generator/Spec Worker/설정집 Worker/비교대상 검색 보고서 Wor
 Planner는 대상 아님). Minutes Generator는 이걸로 STT 오인식 가능성이 있는
 사내 고유명사를 용어집 표기로 교정한다(확신 없으면 원문 유지).
 
-Aggregator/ZIP/Gate 2 UI는 아직 없음(Phase 4 나머지 범위).
+Gate 2는 별도 그래프 노드(interrupt_before)로 만들지 않았다 - 모든 fan-out
+트랙이 끝나면 그래프는 이미 END에 도달해 있고, Gate 2는 "확인 후 다음
+단계로 진행"을 막을 필요가 없는 단계(그 뒤엔 ZIP 다운로드뿐)라 형식적인
+interrupt 하나 추가하는 것보다 완료 화면에 escalated_tasks/technical_failures
+요약 섹션을 넣는 쪽이 더 가볍다고 판단했다(사용자 확인). "재시도(추가
+컨텍스트 포함)"가 필요하면 완료 화면에서 `graph.update_state(config,
+{...}, as_node=<해당 worker 노드>)` 후 `graph.invoke(None, config)`로 그
+트랙만 다시 실행한다 - 그래프가 이미 END에 도달했어도 체크포인터에 상태가
+남아있어 이 방식이 그대로 동작한다([src/ui/app.py](ui/app.py) 참고).
+Aggregator는 그래프 노드가 아니라 [src/aggregator.py](aggregator.py)의
+평범한 함수다(완료 화면의 다운로드 버튼이 `graph.get_state(config).values`를
+읽어 그때그때 ZIP을 만든다) - 대시보드 렌더링 없이 다운로드만 필요하다는
+스코프 결정에 따라 그래프 오케스트레이션이 필요 없다고 판단했다.
 """
 import logging
 import os
@@ -61,7 +82,7 @@ from src.nodes.reference_report import reference_report_validator, reference_rep
 from src.nodes.setting_doc import setting_doc_validator, setting_doc_worker
 from src.nodes.spec import spec_validator, spec_worker
 from src.nodes.style_planner import plan_image_style
-from src.retry import route_decision
+from src.retry import has_technical_failure, route_decision
 from src.state import AgentMeetingState
 
 GATE_0_NODE = "gate_0"
@@ -113,9 +134,19 @@ def _dispatch_after_gate1(state: AgentMeetingState) -> list:
 
 
 def _make_validation_router(track: str):
-    """spec/setting_doc/reference_report 공용: validator 이후 done/retry/escalate 라우팅."""
+    """spec/setting_doc/reference_report 공용: validator 이후 done/retry/escalate 라우팅.
+
+    기술적 실패(4.8)는 재시도하지 않는다([src/retry.py](retry.py) 모듈
+    docstring 참고) - 먼저 확인해서 "done"으로 바로 보낸다(정상 통과와
+    같은 목적지지만, technical_failures에 기록이 남아있어 완료 화면에서
+    구분 표시된다). Worker가 실패하면 Validator는 검증을 건너뛰고 `{}`만
+    반환하므로(각 노드 참고), 이 체크 없이 바로 `state["validation_status"][track]`을
+    읽으면 그 키가 아예 없어 KeyError가 난다.
+    """
 
     def _route(state: AgentMeetingState) -> str:
+        if has_technical_failure(state, track):
+            return "done"
         feedback = state["validation_status"][track]
         return route_decision(feedback, MAX_RETRIES)
 

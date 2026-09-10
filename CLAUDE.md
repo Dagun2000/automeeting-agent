@@ -20,8 +20,54 @@ docstring 참고) - 한때는 이 문제를 피하려고 이미지별 전체 처
 지적으로 발견) - 그래프 레벨로 다시 쪼개 이 대기를 없앴다(실측 확인:
 분리 전에는 이미지 검증까지 다 끝나야 설정집 Validator가 시작했는데,
 분리 후에는 이미지 생성만 끝나면 설정집 Validator가 동시에 시작함).
-Diarization, Gate 2 에스컬레이션 UI, Aggregator/ZIP은 아직 없음(Phase 4
-나머지 범위는 스펙 6장 참고).
+Diarization은 스코프 밖(아래 Phase 4 STT 참고).
+
+**Phase 5 구현됨(기술적 실패 안전망 + 완료 화면 확인/재시도 + ZIP)**: 4.8의
+두 안전망(내용 품질 실패/기술적 실패)을 분리 완성했다 - 각 Worker/Validator
+노드 함수 전체를 try/except로 감싸 API 에러 등을 잡으면
+`technical_failures`(dict, 트랙별 에러 메시지)에 기록하고 그 트랙만 멈춘다
+(다른 트랙은 계속 진행, [src/retry.py](src/retry.py)의 `has_technical_failure`가
+Validator의 검증 스킵과 그래프 라우팅 양쪽에서 공용으로 쓰임). 기술적
+실패는 자동 재시도하지 않는다(4.8이 자동 재시도를 요구하지 않고, API 에러가
+한 번 났다고 바로 재호출해도 성공 보장이 없음).
+
+Gate 2는 별도 `interrupt_before` 그래프 노드로 만들지 않았다(스펙 5.3은
+그래프 노드를 제안하지만, 모든 fan-out이 끝나면 그래프가 이미 END에
+도달해 있고 그 뒤엔 ZIP 다운로드뿐이라 형식적인 interrupt보다 완료
+화면의 "확인이 필요한 항목" 요약 섹션이 더 가볍다고 판단 - 사용자 확인,
+자세한 이유는 [src/graph.py](src/graph.py) 모듈 docstring 참고). 완료
+화면([src/ui/app.py](src/ui/app.py))이 escalated_tasks(내용 품질,
+재시도 한도 초과)와 technical_failures(기술적 실패)를 구분해서 보여주고,
+각 항목마다 "재시도"(추가 컨텍스트 입력 가능)/"무시하고 넘어가기" 버튼을
+제공한다. "재시도"는 그래프 스케줄러를 다시 태우지 않고 해당 트랙의
+Worker/Validator 함수를 직접 호출해서 결과만 `update_state`로 반영한다
+(`_retry_track` 참고) - 이미지 트랙은 Send 로컬 스코프 필드 때문에
+`update_state(as_node=...)`로 기존 조건부 엣지를 재활용하는 방식이 안
+통해서(실측 확인), 텍스트/이미지 트랙 전부 이 직접 호출 방식으로
+통일했다. `escalated_tasks`(append-only 리스트)/`technical_failures`
+(dict-union)는 리듀서 특성상 항목을 지울 수 없어서, "지금도 확인이
+필요한가"는 과거 이력이 아니라 현재 `validation_status`/`technical_failures`
+값을 다시 확인해서 판단한다(`_needs_attention` 참고, 재시도 성공 시
+`technical_failures[track]`을 `None`으로 덮어써서 화면에서 사라지게 함).
+
+Aggregator는 그래프 노드가 아니라 [src/aggregator.py](src/aggregator.py)의
+평범한 함수다(완료 화면 다운로드 버튼이 `graph.get_state(config).values`를
+읽어 그때그때 ZIP을 만듦) - 대시보드 렌더링 없이 다운로드만 필요하다는
+스코프 결정에 따라 그래프 오케스트레이션이 필요 없다고 판단했다(사용자
+확인). **PDF 대신 .md 그대로 ZIP에 담는다** - 스펙 4.9 원안은 PDF였지만,
+Markdown 속 Mermaid 다이어그램을 이미지로 렌더링하려면 헤드리스
+브라우저(mermaid-cli)나 시스템 의존성이 있는 PDF 라이브러리(WeasyPrint ->
+Pango 등)가 필요해 복잡도가 크게 늘어나는 데 비해, .md 그대로 두면
+GitHub/VSCode/Obsidian 등 대부분의 마크다운 뷰어가 ```mermaid``` 펜스를
+그대로 렌더링해줘서 추가 처리 없이도 다이어그램이 보인다(사용자 확인 후
+PDF 변환 자체를 스코프에서 뺌 - src/aggregator.py 모듈 docstring 참고).
+기술적 실패로 일부 산출물이 없어도 ZIP은 정상 생성되고(부분 실패 허용),
+모든 트랙이 실패해도 최소한 원본 회의록은 항상 담긴다.
+
+통합 테스트: [tests/test_full_pipeline.py](tests/test_full_pipeline.py) -
+기본은 구조 확인만(무료), `--real` 플래그로 실제 API를 써서 텍스트 입력부터
+Gate 0/1/Fan-out/ZIP까지 전부 돌려볼 수 있다(비용 발생, 스크립트 docstring
+참고).
 
 **Phase 4 STT 구현됨(Diarization 제외)**: [src/stt.py](src/stt.py) — OpenAI
 오디오 트랜스크립션 API(`STT_MODEL`, 기본 `whisper-1`) 직접 호출. UI 기본
@@ -130,5 +176,7 @@ GPT 이미지 모델(`gpt-image-1`/`gpt-image-1-mini`/`gpt-image-1.5` 등)로 �
 - [src/nodes/setting_doc.py](src/nodes/setting_doc.py): 설정집 Worker/Validator (스펙 4.5, 4.9)
 - [src/nodes/reference_report.py](src/nodes/reference_report.py): 비교대상 검색 보고서 Worker(ToolNode 검색 서브그래프 내장)/Validator, 그래프 레벨 노드 (스펙 4.5, 4.9)
 - [src/nodes/image.py](src/nodes/image.py): 이미지 Worker/Validator, Send 동적 Fan-out (스펙 4.6, 4.7)
-- [src/graph.py](src/graph.py): 그래프 골격 + Gate 0/1 + 재시도 루프 + Fan-out 라우팅 (Phase 1~3 범위)
-- [src/ui/app.py](src/ui/app.py): Streamlit — 녹음/디버그 텍스트 입력, Gate 0, Gate 1, 최종 결과 화면
+- [src/graph.py](src/graph.py): 그래프 골격 + Gate 0/1 + 재시도 루프(기술적 실패 라우팅 포함) + Fan-out 라우팅
+- [src/aggregator.py](src/aggregator.py): ZIP 패키징 (그래프 노드 아님, 완료 화면 다운로드 버튼이 호출 - 스펙 4.9)
+- [src/ui/app.py](src/ui/app.py): Streamlit — 녹음/디버그 텍스트 입력, Gate 0, Gate 1, 최종 결과 화면(확인이 필요한 항목 + ZIP 다운로드)
+- [tests/test_full_pipeline.py](tests/test_full_pipeline.py): Phase 1~5 통합 테스트 (기본 구조 확인만, `--real`로 실제 API 전체 실행)

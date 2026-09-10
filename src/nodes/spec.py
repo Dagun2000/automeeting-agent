@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from src.llm import build_chat_model
 from src.rag import format_rag_context
-from src.retry import next_feedback
+from src.retry import has_technical_failure, next_feedback
 from src.state import AgentMeetingState, TaskFeedback
 from src.tagging import extract_tagged_content
 
@@ -88,30 +88,41 @@ def _build_worker_chain(model: str = SPEC_WORKER_MODEL):
 
 
 def spec_worker(state: AgentMeetingState) -> dict:
-    """Spec Worker 노드: 선정된 아이디어 내용 -> spec_document."""
-    idea_content = extract_tagged_content(
-        state["meeting_minutes_confirmed"], state["selected_idea_tag"]
-    )
+    """Spec Worker 노드: 선정된 아이디어 내용 -> spec_document.
 
-    prev_feedback = state.get("validation_status", {}).get("spec")
-    if prev_feedback and not prev_feedback["is_valid"]:
-        feedback_block = (
-            f"이전 기획서:\n{state.get('spec_document') or '(없음)'}\n\n"
-            f"검증 피드백(critique):\n{prev_feedback['critique']}\n\n"
-            "critique가 지적한 필드만 고치세요 - 지적되지 않은 필드는 이전"
-            " 기획서 그대로 유지하고 다시 쓰지 마세요."
+    기술적 실패(API 에러/타임아웃 등, 4.8)는 통째로 잡아서 technical_failures에
+    기록하고 예외를 밖으로 내보내지 않는다 - 그래야 이 트랙만 멈추고 다른
+    트랙(설정집/검색 보고서/이미지)은 계속 진행된다(그래프 실행 전체가 죽지
+    않음). 내용 품질 실패(critique 재시도)와는 별개의 안전망이라 별도 필드에
+    기록한다([src/retry.py](../retry.py) 모듈 docstring 참고).
+    """
+    try:
+        idea_content = extract_tagged_content(
+            state["meeting_minutes_confirmed"], state["selected_idea_tag"]
         )
-    else:
-        feedback_block = "(초기 생성 - 이전 시도 없음)"
 
-    chain = _build_worker_chain()
-    spec_document = chain.invoke(
-        {
-            "idea_content": idea_content,
-            "rag_context": format_rag_context(state.get("rag_references") or []),
-            "feedback_block": feedback_block,
-        }
-    )
+        prev_feedback = state.get("validation_status", {}).get("spec")
+        if prev_feedback and not prev_feedback["is_valid"]:
+            feedback_block = (
+                f"이전 기획서:\n{state.get('spec_document') or '(없음)'}\n\n"
+                f"검증 피드백(critique):\n{prev_feedback['critique']}\n\n"
+                "critique가 지적한 필드만 고치세요 - 지적되지 않은 필드는 이전"
+                " 기획서 그대로 유지하고 다시 쓰지 마세요."
+            )
+        else:
+            feedback_block = "(초기 생성 - 이전 시도 없음)"
+
+        chain = _build_worker_chain()
+        spec_document = chain.invoke(
+            {
+                "idea_content": idea_content,
+                "rag_context": format_rag_context(state.get("rag_references") or []),
+                "feedback_block": feedback_block,
+            }
+        )
+    except Exception as e:
+        logger.error("spec_worker technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"spec": str(e)}}
     return {"spec_document": spec_document}
 
 
@@ -157,15 +168,27 @@ def _build_validator_chain(model: str = SPEC_VALIDATOR_MODEL):
 
 
 def spec_validator(state: AgentMeetingState) -> dict:
-    """Spec Validator 노드: spec_document 검증 -> validation_status["spec"]."""
-    idea_content = extract_tagged_content(
-        state["meeting_minutes_confirmed"], state["selected_idea_tag"]
-    )
+    """Spec Validator 노드: spec_document 검증 -> validation_status["spec"].
 
-    chain = _build_validator_chain()
-    result: SpecValidationResult = chain.invoke(
-        {"idea_content": idea_content, "spec_document": state["spec_document"]}
-    )
+    Worker가 이미 기술적 실패를 기록했으면 검증 자체를 건너뛴다(없는/부실한
+    산출물을 검증해봐야 의미가 없고, API 호출만 낭비). Validator 자신의
+    LLM 호출이 실패하는 경우도 별도로 잡아 technical_failures에 기록한다.
+    """
+    if has_technical_failure(state, "spec"):
+        return {}
+
+    try:
+        idea_content = extract_tagged_content(
+            state["meeting_minutes_confirmed"], state["selected_idea_tag"]
+        )
+
+        chain = _build_validator_chain()
+        result: SpecValidationResult = chain.invoke(
+            {"idea_content": idea_content, "spec_document": state["spec_document"]}
+        )
+    except Exception as e:
+        logger.error("spec_validator technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"spec": str(e)}}
 
     prev_feedback = state.get("validation_status", {}).get("spec")
     feedback: TaskFeedback = next_feedback(prev_feedback, result.is_valid, result.critique)

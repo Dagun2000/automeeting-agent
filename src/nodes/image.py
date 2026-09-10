@@ -155,23 +155,46 @@ def image_worker(payload: dict) -> dict:
     (route_worker_to_validator)이 이어받게 한다 - 이 값들은 이 브랜치의
     로컬 state일 뿐 전역에 병합되는 채널이 아니므로(모듈 docstring 참고),
     다음 노드에 명시적으로 다시 넘겨줘야 한다.
+
+    기술적 실패(4.8 - 이미지 생성 API 에러 등)는 통째로 잡아 `worker_error`로
+    다음 홉에 넘긴다(이 브랜치의 로컬 값이라 top-level technical_failures에는
+    아직 안 씀 - image_validator가 최종적으로 기록한다, 아래 참고). 실패해도
+    빈 리스트를 반환하는 게 아니라 반드시 image_validator까지는 보낸다 -
+    Send 기반 분기라 여기서 그냥 멈추면(빈 값 반환) 이 브랜치가 image_tasks/
+    technical_failures 어디에도 기록을 못 남기고 조용히 사라진다.
     """
+    subject = payload["subject"]
+    brief = payload["brief"]
+    style_guide = payload["style_guide"]
     prev = payload.get("feedback")
-    critique = prev["critique"] if prev and not prev["is_valid"] else None
-    prompt = _build_image_prompt(payload["subject"], payload["brief"], payload["style_guide"], critique)
-    image_url = _generate_image(prompt)
+    try:
+        critique = prev["critique"] if prev and not prev["is_valid"] else None
+        prompt = _build_image_prompt(subject, brief, style_guide, critique)
+        image_url = _generate_image(prompt)
+    except Exception as e:
+        logger.error("image_worker(%s) technical failure: %s", subject, e, exc_info=True)
+        return {
+            "subject": subject,
+            "brief": brief,
+            "style_guide": style_guide,
+            "image_url": None,
+            "feedback": prev,
+            "worker_error": str(e),
+        }
     return {
-        "subject": payload["subject"],
-        "brief": payload["brief"],
-        "style_guide": payload["style_guide"],
+        "subject": subject,
+        "brief": brief,
+        "style_guide": style_guide,
         "image_url": image_url,
         "feedback": prev,
+        "worker_error": None,
     }
 
 
 def route_worker_to_validator(state: dict) -> list:
     """image_worker 다음 홉 - 반드시 `Send`로 명시해야 이 브랜치의 subject가
-    다른 이미지 브랜치와 안 섞인다(모듈 docstring 참고, 실측 확인)."""
+    다른 이미지 브랜치와 안 섞인다(모듈 docstring 참고, 실측 확인). worker_error도
+    그대로 넘겨서 image_validator가 기술적 실패를 최종 기록하게 한다."""
     return [
         Send(
             "image_validator",
@@ -181,6 +204,7 @@ def route_worker_to_validator(state: dict) -> list:
                 "style_guide": state["style_guide"],
                 "image_url": state["image_url"],
                 "feedback": state.get("feedback"),
+                "worker_error": state.get("worker_error"),
             },
         )
     ]
@@ -192,24 +216,76 @@ def image_validator(state: dict) -> dict:
     시도 결과로 덮어써서, 어느 시점에 봐도 "가장 최근 시도"가 반영되게 한다
     - image_tasks 커스텀 reducer가 subject 키 기준으로 병합하므로 여러 번
     써도 안전).
+
+    Worker가 이미지 생성에 실패했으면(worker_error) 검증 자체를 건너뛰고
+    바로 technical_failures에 기록한다(없는 이미지를 검증해봐야 의미가
+    없다). Validator 자신의 vision 호출이 실패하는 경우도 별도로 잡는다.
+    기술적 실패는 4.8에 따라 재시도하지 않는다(route_after_image_validate
+    참고) - critique 기반 재시도(content 품질)와는 별개의 안전망이다.
     """
     subject = state["subject"]
-    result = _validate_image(subject, state["brief"], state["style_guide"], state["image_url"])
-    feedback = next_feedback(state.get("feedback"), result.is_valid, result.critique)
+    brief = state["brief"]
+    style_guide = state["style_guide"]
+    prev_feedback = state.get("feedback")
+    worker_error = state.get("worker_error")
+
+    if worker_error:
+        updated_task: ImageTask = {
+            "subject": subject,
+            "enabled": True,
+            "brief": brief,
+            "image_url": None,
+            "validation": prev_feedback,
+        }
+        return {
+            "subject": subject,
+            "brief": brief,
+            "style_guide": style_guide,
+            "image_url": None,
+            "feedback": prev_feedback,
+            "technical_failure": worker_error,
+            "image_tasks": [updated_task],
+            "technical_failures": {f"image_{subject}": worker_error},
+        }
+
+    try:
+        result = _validate_image(subject, brief, style_guide, state["image_url"])
+    except Exception as e:
+        logger.error("image_validator(%s) technical failure: %s", subject, e, exc_info=True)
+        updated_task = {
+            "subject": subject,
+            "enabled": True,
+            "brief": brief,
+            "image_url": state["image_url"],
+            "validation": prev_feedback,
+        }
+        return {
+            "subject": subject,
+            "brief": brief,
+            "style_guide": style_guide,
+            "image_url": state["image_url"],
+            "feedback": prev_feedback,
+            "technical_failure": str(e),
+            "image_tasks": [updated_task],
+            "technical_failures": {f"image_{subject}": str(e)},
+        }
+
+    feedback = next_feedback(prev_feedback, result.is_valid, result.critique)
 
     updated_task: ImageTask = {
         "subject": subject,
         "enabled": True,
-        "brief": state["brief"],
+        "brief": brief,
         "image_url": state["image_url"],
         "validation": feedback,
     }
     update: dict = {
         "subject": subject,
-        "brief": state["brief"],
-        "style_guide": state["style_guide"],
+        "brief": brief,
+        "style_guide": style_guide,
         "image_url": state["image_url"],
         "feedback": feedback,
+        "technical_failure": None,
         "image_tasks": [updated_task],
         "validation_status": {f"image_{subject}": feedback},
     }
@@ -232,7 +308,15 @@ def image_validator(state: dict) -> dict:
 def route_after_image_validate(state: dict) -> list:
     """image_validator 다음 홉 - 재시도면 `Send`로 image_worker를 다시
     호출(모듈 docstring 참고), 아니면 빈 리스트를 반환해 이 브랜치를
-    자연스럽게 끝낸다(다른 브랜치에 영향 없음, 실측 확인)."""
+    자연스럽게 끝낸다(다른 브랜치에 영향 없음, 실측 확인).
+
+    기술적 실패(technical_failure)는 재시도하지 않는다(4.8, [src/retry.py](../retry.py)
+    모듈 docstring 참고) - `state["feedback"]`이 None일 수도 있어(예: 첫
+    시도에서 이미지 생성 자체가 실패한 경우) route_decision을 호출하면
+    터지므로, 이 체크를 반드시 먼저 해야 한다.
+    """
+    if state.get("technical_failure"):
+        return []
     decision = route_decision(state["feedback"], MAX_RETRIES)
     if decision != "retry":
         return []

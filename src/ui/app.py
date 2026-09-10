@@ -57,7 +57,12 @@ logging.basicConfig(
     ],
 )
 
+from src.aggregator import build_zip  # noqa: E402
 from src.graph import build_graph  # noqa: E402
+from src.nodes.image import image_validator, image_worker, route_worker_to_validator  # noqa: E402
+from src.nodes.reference_report import reference_report_validator, reference_report_worker  # noqa: E402
+from src.nodes.setting_doc import setting_doc_validator, setting_doc_worker  # noqa: E402
+from src.nodes.spec import spec_validator, spec_worker  # noqa: E402
 from src.stt import transcribe  # noqa: E402
 
 SAMPLE_TRANSCRIPT_PATH = ROOT / "sample_data" / "sample_meeting.txt"
@@ -377,6 +382,7 @@ def reset_session() -> None:
     st.session_state.pop("thread_id", None)
     st.session_state.pop("manual_image_tasks", None)
     st.session_state.pop("stt_transcript", None)
+    st.session_state.pop("dismissed_reviews", None)
     # debug_mode는 일부러 안 지운다 - 디버그로 들어온 사용자가 "새 회의로
     # 다시 시작"을 눌러도 녹음 화면으로 튕기지 않고 디버그 화면에 남는다.
 
@@ -389,17 +395,123 @@ def resolve_image_source(image_url: str):
     return image_url
 
 
-def render_validation(feedback: dict | None, track_key: str, escalated_tasks: list) -> None:
+def render_validation(feedback: dict | None) -> None:
+    """검증 상태(통과/미통과 + critique)만 보여준다 - 에스컬레이션/기술적
+    실패는 화면 상단의 "확인이 필요한 항목" 요약 섹션이 따로 담당한다
+    (아래 render_review_section 참고, 그쪽이 재시도/무시 버튼까지 제공)."""
     if feedback:
         status = "통과" if feedback["is_valid"] else "미통과"
         st.write(f"검증 상태: {status} (retry_count={feedback['retry_count']})")
         if not feedback["is_valid"]:
             st.write(f"critique: {feedback['critique']}")
-    if track_key in (escalated_tasks or []):
-        st.warning(
-            "재시도 한도(MAX_RETRIES)를 초과해 Gate 2 에스컬레이션 대상으로 "
-            "기록됐습니다 (Gate 2 UI는 Phase 4에서 구현 예정)."
-        )
+
+
+_TRACK_LABELS = {
+    "spec": "기획서",
+    "setting_doc": "설정집",
+    "reference_report": "비교대상 검색 보고서",
+}
+
+
+def _track_label(track: str) -> str:
+    if track in _TRACK_LABELS:
+        return _TRACK_LABELS[track]
+    if track.startswith("image_"):
+        return f"이미지 · {track[len('image_'):]}"
+    return track
+
+
+def _needs_attention(values: dict, track: str) -> str | None:
+    """이 트랙이 지금도 확인이 필요한 상태인지 판단해 "escalated"/"technical"/None
+    중 하나를 반환한다. escalated_tasks(append-only reducer)/technical_failures
+    (dict-union reducer, 재시도 성공 시 값만 None으로 덮어씀 - 아래 _retry_track
+    참고)는 리스트/딕셔너리에서 항목을 지울 수 없으므로, 과거 이력이 아니라
+    "지금" validation_status/technical_failures가 실제로 실패를 나타내는지로
+    다시 확인한다(재시도가 성공했으면 더 이상 표시하지 않기 위함)."""
+    if (values.get("technical_failures") or {}).get(track):
+        return "technical"
+    if track in (values.get("escalated_tasks") or []):
+        feedback = values.get("validation_status", {}).get(track)
+        if not feedback or not feedback.get("is_valid"):
+            return "escalated"
+    return None
+
+
+_TRACK_WORKER_VALIDATOR = {
+    "spec": (spec_worker, spec_validator),
+    "setting_doc": (setting_doc_worker, setting_doc_validator),
+    "reference_report": (reference_report_worker, reference_report_validator),
+}
+
+
+def _retry_track(graph, config, values: dict, track: str, extra_context: str) -> None:
+    """트랙 하나(spec/setting_doc/reference_report/image_<subject>)를 Worker
+    -> Validator 직접 호출로 재실행하고, 결과를 `graph.update_state`로 반영한다
+    ("확인이 필요한 항목" 섹션의 "재시도" 버튼이 호출).
+
+    그래프 스케줄러를 다시 태우지 않고 두 노드 함수를 직접 호출하는 이유:
+    텍스트 트랙(spec/설정집/검색 보고서)은 `update_state(..., as_node=...)`로
+    기존 조건부 엣지(validator -> retry -> worker)를 재활용하는 방법도 합성
+    테스트로 동작을 확인했지만, 이미지 트랙은 Worker/Validator가 `Send`로
+    파견되는 로컬 스코프 필드(subject/brief/style_guide/feedback)를 쓰는데
+    이 필드들은 전역 AgentMeetingState에 없어서 같은 방식이 성립하지 않는다
+    (image_worker/image_validator의 라우팅 함수가 기대하는 입력을 전역
+    state에서 못 채움). 두 경우 다 결과적으로 같은 전역 채널
+    (image_tasks/validation_status/technical_failures)만 갱신하면 그래프
+    입장에서는 구분이 안 되므로, 모든 트랙을 직접 호출 방식으로 통일했다.
+
+    기술적 실패였던 트랙도 이 함수로 재시도할 수 있다 - Worker/Validator를
+    부르기 전에 이 트랙의 technical_failures만 지운 로컬 뷰를 넘기고(안 지우면
+    Validator가 has_technical_failure를 보고 검증 자체를 건너뛴다), 이번
+    시도가 기술적 실패 없이 끝나면 실제 state에도 그 키를 None으로 덮어써
+    화면에서 사라지게 한다(technical_failures는 dict-union reducer라 키
+    자체를 지울 수는 없지만, 값을 None으로 덮으면 `_needs_attention`이
+    falsy로 처리한다 - escalated_tasks도 같은 이유로 append-only라 못
+    지우고, 대신 `_needs_attention`이 매번 validation_status를 다시 확인해
+    최신 성공 여부를 판단한다).
+    """
+    reset_feedback = {
+        "is_valid": False,
+        "critique": extra_context.strip() if extra_context and extra_context.strip() else "(추가 코멘트 없이 재시도)",
+        "retry_count": 0,
+    }
+
+    if track.startswith("image_"):
+        subject = track[len("image_") :]
+        task = next((t for t in values.get("image_tasks", []) if t["subject"] == subject), None)
+        if task is None:
+            return
+        payload = {
+            "subject": subject,
+            "brief": task.get("brief", ""),
+            "style_guide": values.get("image_style_guide") or "",
+            "feedback": reset_feedback,
+        }
+        worker_result = image_worker(payload)
+        validator_payload = route_worker_to_validator(worker_result)[0].arg
+        result = image_validator(validator_payload)
+        update = {
+            k: v
+            for k, v in result.items()
+            if k in ("image_tasks", "validation_status", "technical_failures", "escalated_tasks")
+        }
+    else:
+        worker_fn, validator_fn = _TRACK_WORKER_VALIDATOR[track]
+        local_state = dict(values)
+        local_state["validation_status"] = {**values.get("validation_status", {}), track: reset_feedback}
+        local_state["technical_failures"] = {
+            k: v for k, v in (values.get("technical_failures") or {}).items() if k != track
+        }
+        worker_result = worker_fn(local_state)
+        merged = {**local_state, **worker_result}
+        validator_result = validator_fn(merged)
+        update = {**worker_result, **validator_result}
+
+    if "technical_failures" not in update:
+        # 이번 시도는 기술적 실패 없이 끝남 - 예전 기록이 있었다면 지운다.
+        update["technical_failures"] = {track: None}
+
+    graph.update_state(config, update)
 
 
 st.set_page_config(page_title="AutoMeeting Agent", layout="wide")
@@ -734,21 +846,77 @@ with main_col:
         st.subheader("4. 결과")
 
         values = snapshot.values
-        escalated_tasks = values.get("escalated_tasks", [])
+        selected_tag = values.get("selected_idea_tag")
 
         confirmed = values.get("meeting_minutes_confirmed")
         if confirmed:
             with st.expander("확정된 회의록"):
                 st.text(confirmed)
 
-        selected_tag = values.get("selected_idea_tag")
+        # --- 확인이 필요한 항목 (에스컬레이션 + 기술적 실패, 구분 표시) ---
+        # 그래프에 별도 Gate 2 interrupt 노드를 두지 않고 완료 화면에 요약
+        # 섹션으로 넣기로 했다([src/graph.py](../graph.py) 모듈 docstring
+        # 참고) - 재시도는 여기서 바로 처리한다(_retry_track).
+        review_tracks: list[str] = []
+        if selected_tag:
+            review_tracks.append("spec")
+            task_briefs = values.get("task_briefs", {})
+            if task_briefs.get("setting_doc", {}).get("enabled"):
+                review_tracks.append("setting_doc")
+            if task_briefs.get("reference_report", {}).get("enabled"):
+                review_tracks.append("reference_report")
+            for t in values.get("image_tasks", []):
+                if t.get("enabled"):
+                    review_tracks.append(f"image_{t['subject']}")
+
+        dismissed = st.session_state.setdefault("dismissed_reviews", set())
+        needs_review = [
+            (track, kind)
+            for track in review_tracks
+            if (kind := _needs_attention(values, track)) and track not in dismissed
+        ]
+
+        if needs_review:
+            st.markdown("### 확인이 필요한 항목")
+            st.caption(
+                "내용 품질 실패(재시도 한도 초과)와 기술적 실패(API 에러 등)를 구분해서 보여줍니다."
+            )
+            for track, kind in needs_review:
+                label = _track_label(track)
+                with st.container(border=True):
+                    if kind == "technical":
+                        st.error(f"**{label}** — 기술적 실패")
+                        st.write(f"오류: {(values.get('technical_failures') or {}).get(track)}")
+                    else:
+                        st.warning(f"**{label}** — 재시도 한도 초과(내용 품질)")
+                        feedback = values.get("validation_status", {}).get(track)
+                        if feedback:
+                            st.write(f"critique: {feedback.get('critique')}")
+
+                    extra_context = st.text_area(
+                        "추가 컨텍스트(선택) — 재시도 시 Worker에게 그대로 전달됩니다",
+                        key=f"retry_context_{track}",
+                        height=80,
+                    )
+                    col_retry, col_dismiss = st.columns(2)
+                    with col_retry:
+                        if st.button("재시도", key=f"retry_btn_{track}"):
+                            with st.spinner(f"{label} 재시도 중..."):
+                                _retry_track(graph, config, values, track, extra_context)
+                            st.rerun()
+                    with col_dismiss:
+                        if st.button("무시하고 넘어가기", key=f"dismiss_btn_{track}"):
+                            dismissed.add(track)
+                            st.rerun()
+            st.divider()
+
         if not selected_tag:
             st.info("구체적으로 진전된 아이디어가 없어, 회의록만 출력하고 파이프라인을 종료했습니다.")
         else:
             st.write(f"선정된 아이디어: **{selected_tag}**")
 
             st.markdown("### 기획서")
-            render_validation(values.get("validation_status", {}).get("spec"), "spec", escalated_tasks)
+            render_validation(values.get("validation_status", {}).get("spec"))
             with st.expander("기획서 펼치기", expanded=False):
                 st.markdown(values.get("spec_document") or "(없음)")
 
@@ -756,18 +924,12 @@ with main_col:
 
             if task_briefs.get("setting_doc", {}).get("enabled"):
                 st.markdown("### 설정집")
-                render_validation(
-                    values.get("validation_status", {}).get("setting_doc"), "setting_doc", escalated_tasks
-                )
+                render_validation(values.get("validation_status", {}).get("setting_doc"))
                 st.markdown(values.get("setting_doc") or "(생성 중 문제가 발생했습니다)")
 
             if task_briefs.get("reference_report", {}).get("enabled"):
                 st.markdown("### 비교대상 검색 보고서")
-                render_validation(
-                    values.get("validation_status", {}).get("reference_report"),
-                    "reference_report",
-                    escalated_tasks,
-                )
+                render_validation(values.get("validation_status", {}).get("reference_report"))
                 st.markdown(values.get("reference_report") or "(생성 중 문제가 발생했습니다)")
 
             image_tasks = [t for t in values.get("image_tasks", []) if t.get("enabled")]
@@ -775,11 +937,19 @@ with main_col:
                 st.markdown(f"### 이미지 ({len(image_tasks)}개)")
                 for task in image_tasks:
                     st.markdown(f"**{task['subject']}**")
-                    render_validation(task.get("validation"), f"image_{task['subject']}", escalated_tasks)
+                    render_validation(task.get("validation"))
                     if task.get("image_url"):
                         st.image(resolve_image_source(task["image_url"]), caption=task["subject"])
                     else:
                         st.caption("이미지 URL이 없습니다 (생성 실패 가능).")
+
+        st.markdown("### 다운로드")
+        st.download_button(
+            "결과 ZIP 다운로드",
+            data=build_zip(values),
+            file_name="automeeting_결과.zip",
+            mime="application/zip",
+        )
 
         if st.button("새 회의로 다시 시작", key="restart_done"):
             reset_session()

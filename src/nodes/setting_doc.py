@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from src.llm import build_chat_model
 from src.rag import format_rag_context
-from src.retry import next_feedback
+from src.retry import has_technical_failure, next_feedback
 from src.state import AgentMeetingState, TaskFeedback
 from src.tagging import extract_tagged_content
 
@@ -117,37 +117,45 @@ def _build_worker_chain(model: str = SETTING_DOC_WORKER_MODEL):
 
 
 def setting_doc_worker(state: AgentMeetingState) -> dict:
-    """설정집 Worker 노드: 브리핑 + 아이디어 내용 -> setting_doc."""
-    idea_content = extract_tagged_content(
-        state["meeting_minutes_confirmed"], state["selected_idea_tag"]
-    )
-    brief = state["task_briefs"]["setting_doc"]["brief"]
+    """설정집 Worker 노드: 브리핑 + 아이디어 내용 -> setting_doc.
 
-    prev_feedback = state.get("validation_status", {}).get("setting_doc")
-    if prev_feedback and not prev_feedback["is_valid"]:
-        feedback_block = (
-            f"이전 설정집:\n{state.get('setting_doc') or '(없음)'}\n\n"
-            f"검증 피드백(critique):\n{prev_feedback['critique']}\n\n"
-            "critique가 지적한 부분만 고치세요 - 지적되지 않은 행/항목은"
-            " 이전 설정집 그대로 유지하고 다시 쓰지 마세요."
+    기술적 실패(4.8)는 통째로 잡아 technical_failures에 기록하고 예외를
+    밖으로 내보내지 않는다 - 이 트랙만 멈추고 다른 트랙은 계속 진행된다.
+    """
+    try:
+        idea_content = extract_tagged_content(
+            state["meeting_minutes_confirmed"], state["selected_idea_tag"]
         )
-        logger.info(
-            "setting_doc_worker retry (attempt=%d) - previous critique: %s",
-            prev_feedback["retry_count"],
-            prev_feedback["critique"],
-        )
-    else:
-        feedback_block = "(초기 생성 - 이전 시도 없음)"
+        brief = state["task_briefs"]["setting_doc"]["brief"]
 
-    chain = _build_worker_chain()
-    setting_doc = chain.invoke(
-        {
-            "brief": brief,
-            "idea_content": idea_content,
-            "rag_context": format_rag_context(state.get("rag_references") or []),
-            "feedback_block": feedback_block,
-        }
-    )
+        prev_feedback = state.get("validation_status", {}).get("setting_doc")
+        if prev_feedback and not prev_feedback["is_valid"]:
+            feedback_block = (
+                f"이전 설정집:\n{state.get('setting_doc') or '(없음)'}\n\n"
+                f"검증 피드백(critique):\n{prev_feedback['critique']}\n\n"
+                "critique가 지적한 부분만 고치세요 - 지적되지 않은 행/항목은"
+                " 이전 설정집 그대로 유지하고 다시 쓰지 마세요."
+            )
+            logger.info(
+                "setting_doc_worker retry (attempt=%d) - previous critique: %s",
+                prev_feedback["retry_count"],
+                prev_feedback["critique"],
+            )
+        else:
+            feedback_block = "(초기 생성 - 이전 시도 없음)"
+
+        chain = _build_worker_chain()
+        setting_doc = chain.invoke(
+            {
+                "brief": brief,
+                "idea_content": idea_content,
+                "rag_context": format_rag_context(state.get("rag_references") or []),
+                "feedback_block": feedback_block,
+            }
+        )
+    except Exception as e:
+        logger.error("setting_doc_worker technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"setting_doc": str(e)}}
     logger.debug("setting_doc_worker output:\n%s", setting_doc)
     return {"setting_doc": setting_doc}
 
@@ -203,14 +211,22 @@ def setting_doc_validator(state: AgentMeetingState) -> dict:
     """설정집 Validator 노드: setting_doc 검증 -> validation_status["setting_doc"].
 
     브리핑 대비 완결성/카테고리만 확인한다(회의 원문과는 대조하지 않음) -
-    VALIDATOR_SYSTEM_PROMPT 상단 설명 참고.
+    VALIDATOR_SYSTEM_PROMPT 상단 설명 참고. Worker가 이미 기술적 실패를
+    기록했으면 검증 자체를 건너뛴다.
     """
-    brief = state["task_briefs"]["setting_doc"]["brief"]
+    if has_technical_failure(state, "setting_doc"):
+        return {}
 
-    chain = _build_validator_chain()
-    result: SettingDocValidationResult = chain.invoke(
-        {"brief": brief, "setting_doc": state["setting_doc"]}
-    )
+    try:
+        brief = state["task_briefs"]["setting_doc"]["brief"]
+
+        chain = _build_validator_chain()
+        result: SettingDocValidationResult = chain.invoke(
+            {"brief": brief, "setting_doc": state["setting_doc"]}
+        )
+    except Exception as e:
+        logger.error("setting_doc_validator technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"setting_doc": str(e)}}
 
     prev_feedback = state.get("validation_status", {}).get("setting_doc")
     feedback: TaskFeedback = next_feedback(prev_feedback, result.is_valid, result.critique)

@@ -83,7 +83,7 @@ from pydantic import BaseModel, Field
 
 from src.llm import build_chat_model
 from src.rag import format_rag_context
-from src.retry import next_feedback
+from src.retry import has_technical_failure, next_feedback
 from src.state import AgentMeetingState, TaskFeedback
 from src.tools import web_search
 
@@ -355,48 +355,57 @@ def reference_report_worker(state: AgentMeetingState) -> dict:
     대화(`reference_report_messages`)에 critique만 새 turn으로 추가해
     이어간다(모듈 docstring 3번 참고 - 대화를 안 이어가면 검색을 매번
     처음부터 다시 해서 회귀가 났었다).
+
+    기술적 실패(4.8 - 검색 API 에러, LLM 호출 실패 등)는 통째로 잡아
+    technical_failures에 기록한다 - 이 트랙만 멈추고 다른 트랙은 계속
+    진행된다. `existing_messages`는 실패 시에도 그대로 두므로(반환 안 함),
+    이 트랙은 재시도되지 않지만 지금까지의 검색 대화 자체는 유실되지 않는다.
     """
     existing_messages = state.get("reference_report_messages") or []
     prev_feedback = state.get("validation_status", {}).get("reference_report")
 
-    if not existing_messages:
-        brief = state["task_briefs"]["reference_report"]["brief"]
-        systems = state["discussed_systems"]
-        rag_context = format_rag_context(state.get("rag_references") or [])
-        human_content = (
-            f"조사할 시스템 목록: {', '.join(systems)}\n\n"
-            f"생성 지시문(브리핑): {brief}\n\n"
-            f"참고 자료 (사내 용어집/게임 프로필 - RAG 검색 결과, 용어 표기 확인용"
-            f" - 검색 근거로 쓰지 말 것):\n{rag_context}"
-        )
-        input_messages: List[AnyMessage] = [
-            SystemMessage(content=SEARCH_SYSTEM_PROMPT),
-            HumanMessage(content=human_content),
-        ]
-    else:
-        critique = prev_feedback["critique"] if prev_feedback else ""
-        input_messages = list(existing_messages) + [
-            HumanMessage(
-                content=(
-                    "검증 결과 다음 문제가 지적됐습니다 - 지적된 부분만 고쳐서"
-                    " 보고서 전체를 다시 출력하세요:\n"
-                    f"{critique}\n\n"
-                    "지적되지 않은 시스템 섹션/표 행/문장은 방금 작성한 보고서"
-                    " 그대로 유지하세요 - 문제 없다고 이미 확인된 내용을"
-                    " 건드리면 거기서 새 오류가 생길 수 있습니다. 지적된 부분을"
-                    " 고치는 데 필요하면 web_search를 추가로 호출해서 근거를"
-                    " 보강하세요 - 이미 위에서 찾은 근거로 충분한 부분을 다시"
-                    " 검색할 필요는 없습니다. 근거를 못 찾으면 그 부분만"
-                    " 삭제하거나 실제로 뒷받침되는 수준으로 줄이세요. 검색이"
-                    " 끝나면(또는 추가 검색이 필요 없으면) 보고서 전체를 다시"
-                    " 출력하세요."
-                )
+    try:
+        if not existing_messages:
+            brief = state["task_briefs"]["reference_report"]["brief"]
+            systems = state["discussed_systems"]
+            rag_context = format_rag_context(state.get("rag_references") or [])
+            human_content = (
+                f"조사할 시스템 목록: {', '.join(systems)}\n\n"
+                f"생성 지시문(브리핑): {brief}\n\n"
+                f"참고 자료 (사내 용어집/게임 프로필 - RAG 검색 결과, 용어 표기 확인용"
+                f" - 검색 근거로 쓰지 말 것):\n{rag_context}"
             )
-        ]
+            input_messages: List[AnyMessage] = [
+                SystemMessage(content=SEARCH_SYSTEM_PROMPT),
+                HumanMessage(content=human_content),
+            ]
+        else:
+            critique = prev_feedback["critique"] if prev_feedback else ""
+            input_messages = list(existing_messages) + [
+                HumanMessage(
+                    content=(
+                        "검증 결과 다음 문제가 지적됐습니다 - 지적된 부분만 고쳐서"
+                        " 보고서 전체를 다시 출력하세요:\n"
+                        f"{critique}\n\n"
+                        "지적되지 않은 시스템 섹션/표 행/문장은 방금 작성한 보고서"
+                        " 그대로 유지하세요 - 문제 없다고 이미 확인된 내용을"
+                        " 건드리면 거기서 새 오류가 생길 수 있습니다. 지적된 부분을"
+                        " 고치는 데 필요하면 web_search를 추가로 호출해서 근거를"
+                        " 보강하세요 - 이미 위에서 찾은 근거로 충분한 부분을 다시"
+                        " 검색할 필요는 없습니다. 근거를 못 찾으면 그 부분만"
+                        " 삭제하거나 실제로 뒷받침되는 수준으로 줄이세요. 검색이"
+                        " 끝나면(또는 추가 검색이 필요 없으면) 보고서 전체를 다시"
+                        " 출력하세요."
+                    )
+                )
+            ]
 
-    new_messages = _run_search(input_messages)
-    raw_draft = new_messages[-1].content
-    draft = _substitute_citations(raw_draft, new_messages)
+        new_messages = _run_search(input_messages)
+        raw_draft = new_messages[-1].content
+        draft = _substitute_citations(raw_draft, new_messages)
+    except Exception as e:
+        logger.error("reference_report_worker technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"reference_report": str(e)}}
 
     logger.debug("reference_report_worker output:\n%s", draft)
 
@@ -465,24 +474,32 @@ def reference_report_validator(state: AgentMeetingState) -> dict:
     인용 ID 매칭은 다시 검색하지 않고, Worker가 만든 최종 보고서에 매칭 안
     된 `[id]` 패턴이 그대로 남아있는지만 문자열로 확인한다(`_substitute_citations`가
     매칭 실패한 ID는 치환하지 않고 그대로 두므로 - 코드로 100% 정확히
-    판단 가능해 LLM에게 다시 묻지 않는다, 모듈 docstring 참고).
+    판단 가능해 LLM에게 다시 묻지 않는다, 모듈 docstring 참고). Worker가
+    이미 기술적 실패를 기록했으면 검증 자체를 건너뛴다.
     """
+    if has_technical_failure(state, "reference_report"):
+        return {}
+
     systems = state["discussed_systems"]
     report = state["reference_report"]
 
-    leftover_ids = _cited_ids(report)
-    if leftover_ids:
-        result = ReferenceReportValidationResult(
-            is_valid=False,
-            critique=(
-                f"다음 인용 ID가 실제 검색 결과와 매칭되지 않습니다: "
-                f"{sorted(leftover_ids)}. 이 ID를 인용한 사례/행을 삭제하거나,"
-                " 실제로 검색해서 찾은 다른 출처의 ID로 바꾸세요(ID를 새로"
-                " 만들어내지 말고, 검색 결과에 실제로 표시된 ID만 쓰세요)."
-            ),
-        )
-    else:
-        result = _validate(systems, report)
+    try:
+        leftover_ids = _cited_ids(report)
+        if leftover_ids:
+            result = ReferenceReportValidationResult(
+                is_valid=False,
+                critique=(
+                    f"다음 인용 ID가 실제 검색 결과와 매칭되지 않습니다: "
+                    f"{sorted(leftover_ids)}. 이 ID를 인용한 사례/행을 삭제하거나,"
+                    " 실제로 검색해서 찾은 다른 출처의 ID로 바꾸세요(ID를 새로"
+                    " 만들어내지 말고, 검색 결과에 실제로 표시된 ID만 쓰세요)."
+                ),
+            )
+        else:
+            result = _validate(systems, report)
+    except Exception as e:
+        logger.error("reference_report_validator technical failure: %s", e, exc_info=True)
+        return {"technical_failures": {"reference_report": str(e)}}
 
     prev_feedback = state.get("validation_status", {}).get("reference_report")
     feedback: TaskFeedback = next_feedback(prev_feedback, result.is_valid, result.critique)
